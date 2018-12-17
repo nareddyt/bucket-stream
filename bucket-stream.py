@@ -35,9 +35,12 @@ FOUND_COUNT = 0
 
 
 class UpdateThread(Thread):
-    def __init__(self, q, *args, **kwargs):
+    def __init__(self, q, perms_count, *args, **kwargs):
         self.q = q
-        self.checked_buckets_since_last_update = 0
+        self.perms_count = perms_count
+        self.num_possible_buckets_since_last_update = 0
+        self.num_checked_buckets_since_last_update = 0
+        self.found_count_since_last_update = 0
 
         super().__init__(*args, **kwargs)
 
@@ -45,15 +48,26 @@ class UpdateThread(Thread):
         global THREAD_EVENT
 
         while not THREAD_EVENT.is_set():
-            checked_buckets = len(self.q.checked_buckets)
+            num_possible_buckets = len(self.q.discovered_domains) * self.perms_count
+            num_checked_buckets = self.q.num_checked_buckets
 
-            if checked_buckets > 1:
-                cprint("{0} buckets checked ({1:.0f}b/s), {2} buckets found".format(
-                    checked_buckets,
-                    (checked_buckets - self.checked_buckets_since_last_update) / UPDATE_INTERVAL,
-                    FOUND_COUNT), "cyan")
+            cprint("{0} new buckets possible ({1:.0f}b/s), {2} new buckets checked ({3:.0f}b/s), {4} new buckets "
+                   "found, queue size = {5}, rate limited = {6}".format(
+                num_possible_buckets - self.num_possible_buckets_since_last_update,
+                (num_possible_buckets - self.num_possible_buckets_since_last_update) / UPDATE_INTERVAL,
+                num_checked_buckets - self.num_checked_buckets_since_last_update,
+                (num_checked_buckets - self.num_checked_buckets_since_last_update) / UPDATE_INTERVAL,
+                FOUND_COUNT - self.found_count_since_last_update,
+                len(self.q.queue),
+                self.q.rate_limited
+            ), "cyan")
 
-            self.checked_buckets_since_last_update = checked_buckets
+            if len(self.q.queue) > QUEUE_SIZE * 0.99:
+                cprint("Queue is filled! Discovery of new domains and possible buckets will slow down...", "red")
+
+            self.num_possible_buckets_since_last_update = num_possible_buckets
+            self.num_checked_buckets_since_last_update = num_checked_buckets
+            self.found_count_since_last_update = FOUND_COUNT
             THREAD_EVENT.wait(UPDATE_INTERVAL)
 
 
@@ -69,7 +83,7 @@ class CertStreamThread(Thread):
         global THREAD_EVENT
         while not THREAD_EVENT.is_set():
             cprint("Waiting for Certstream events - this could take a few minutes to queue up...",
-               "yellow", attrs=["bold"])
+                   "yellow", attrs=["bold"])
             self.c.run_forever()
             THREAD_EVENT.wait(10)
 
@@ -85,44 +99,49 @@ class CertStreamThread(Thread):
 
             for domain in set(all_domains):
                 # cut the crap
-                if not domain.startswith("*.")\
-                        and "cloudflaressl" not in domain\
-                        and "xn--" not in domain\
-                        and domain.count("-") < 4\
+                if not domain.startswith("*.") \
+                        and "cloudflaressl" not in domain \
+                        and "xn--" not in domain \
+                        and domain.count("-") < 4 \
                         and domain.count(".") < 4:
 
                     parts = tldextract.extract(domain)
-                    for permutation in get_permutations(parts.domain, parts.subdomain):
-                        self.q.put(BUCKET_HOST % permutation)
+
+                    if parts.domain not in self.q.discovered_domains:
+                        for permutation in get_permutations(parts.domain, parts.subdomain):
+                            self.q.put(BUCKET_HOST % permutation)
+                        self.q.discovered_domains.add(parts.domain)
 
 
 class BucketQueue(Queue):
     def __init__(self, maxsize):
         self.lock = Lock()
-        self.checked_buckets = list()
+        self.discovered_domains = set()
+        self.num_checked_buckets = 0
         self.rate_limited = False
         self.next_yield = 0
 
         super().__init__(maxsize)
 
     def put(self, bucket_url):
-        if bucket_url not in self.checked_buckets:
-            self.checked_buckets.append(bucket_url)
-            super().put(bucket_url)
+        super().put(bucket_url)
 
     def get(self):
         global THREAD_EVENT
         with self.lock:
             t = time.monotonic()
             if self.rate_limited and t < self.next_yield:
-                cprint("You have hit the AWS rate limit - slowing down... (tip: enter credentials in config.yaml)", "yellow")
+                cprint("You have hit the AWS rate limit - slowing down... (tip: enter credentials in config.yaml)",
+                       "yellow")
                 THREAD_EVENT.wait(self.next_yield - t)
                 t = time.monotonic()
                 self.rate_limited = False
 
             self.next_yield = t + RATE_LIMIT_SLEEP
 
-        return super().get()
+        item = super().get()
+        self.num_checked_buckets += 1
+        return item
 
 
 class BucketWorker(Thread):
@@ -157,7 +176,7 @@ class BucketWorker(Thread):
         check_response = self.session.head(
             S3_URL, timeout=3, headers={"Host": bucket_url})
 
-        if not ARGS.ignore_rate_limiting\
+        if not ARGS.ignore_rate_limiting \
                 and (check_response.status_code == 503 and check_response.reason == "Slow Down"):
             self.q.rate_limited = True
             # add it back to the queue for re-processing
@@ -167,9 +186,9 @@ class BucketWorker(Thread):
             bucket_response = requests.request(
                 "GET" if ARGS.only_interesting else "HEAD", new_bucket_url, timeout=3)
 
-            if bucket_response.status_code == 200\
+            if bucket_response.status_code == 200 \
                     and (not ARGS.only_interesting or
-                             (ARGS.only_interesting and any(keyword in bucket_response.text for keyword in KEYWORDS))):
+                         (ARGS.only_interesting and any(keyword in bucket_response.text for keyword in KEYWORDS))):
                 self.__output("Found bucket '{}'".format(new_bucket_url), "green")
                 self.__log(new_bucket_url)
 
@@ -180,7 +199,7 @@ class BucketWorker(Thread):
             # just to check if the bucket exists. Throws NoSuchBucket exception if not
             self.session.meta.client.head_bucket(Bucket=bucket_name)
 
-            if not ARGS.only_interesting or\
+            if not ARGS.only_interesting or \
                     (ARGS.only_interesting and self.__bucket_contains_any_keywords(bucket_name)):
                 owner = None
                 acls = None
@@ -227,9 +246,11 @@ class BucketWorker(Thread):
         cprint(line, color, attrs=["bold"])
 
         if CONFIG["slack_webhook"]:
-            resp = requests.post(CONFIG['slack_webhook'], data=json.dumps({'text': line}), headers={'Content-Type': 'application/json'})
+            resp = requests.post(CONFIG['slack_webhook'], data=json.dumps({'text': line}),
+                                 headers={'Content-Type': 'application/json'})
             if resp.status_code != 200:
                 cprint("Could not send to your Slack Webhook. Server returned: %s" % resp.status_code, "red")
+
 
 def get_permutations(domain, subdomain=None):
     perms = [
@@ -250,7 +271,7 @@ def get_permutations(domain, subdomain=None):
 
 
 def stop():
-    global  THREAD_EVENT
+    global THREAD_EVENT
     cprint("Kill commanded received - Quitting...", "yellow", attrs=["bold"])
     THREAD_EVENT.set()
     sys.exit(0)
@@ -265,9 +286,10 @@ def main():
 
     signal.signal(signal.SIGINT, __signal_handler)
 
-    parser = argparse.ArgumentParser(description="Find interesting Amazon S3 Buckets by watching certificate transparency logs.",
-                                     usage="python bucket-stream.py",
-                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description="Find interesting Amazon S3 Buckets by watching certificate transparency logs.",
+        usage="python bucket-stream.py",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--only-interesting", action="store_true", dest="only_interesting", default=False,
                         help="Only log 'interesting' buckets whose contents match anything within keywords.txt")
     parser.add_argument("--skip-lets-encrypt", action="store_true", dest="skip_lets_encrypt", default=False,
@@ -278,8 +300,6 @@ def main():
                         help="If you ignore rate limits not all buckets will be checked")
     parser.add_argument("-l", "--log", dest="log_to_file", default=False, action="store_true",
                         help="Log found buckets to a file buckets.log")
-    parser.add_argument("-s", "--source", dest="source", default=None,
-                        help="Data source to check for bucket permutations. Uses certificate transparency logs if not specified.")
     parser.add_argument("-p", "--permutations", dest="permutations", default="permutations\default.txt",
                         help="Path of file containing a list of permutations to try (see permutations/ dir).")
 
@@ -287,28 +307,24 @@ def main():
     logging.disable(logging.WARNING)
 
     if not CONFIG["aws_access_key"] or not CONFIG["aws_secret"]:
-        cprint("It is highly recommended to enter AWS keys in config.yaml otherwise you will be severely rate limited!"\
+        cprint("It is highly recommended to enter AWS keys in config.yaml otherwise you will be severely rate limited!" \
                "You might want to run with --ignore-rate-limiting", "red")
 
         if ARGS.threads > 5:
             cprint("No AWS keys, reducing threads to 5 to help with rate limiting.", "red")
             ARGS.threads = 5
 
+    perms_count = len([x for x in get_permutations("")])
     THREADS = list()
 
-    cprint("Starting bucket-stream with {0} threads. Loaded {1} permutations."\
-        .format(ARGS.threads, len([x for x in get_permutations("")])), "green")
+    cprint("Starting bucket-stream with {0} threads. Loaded {1} permutations." \
+           .format(ARGS.threads, perms_count), "green")
 
     q = BucketQueue(maxsize=QUEUE_SIZE)
     THREADS.extend([BucketWorker(q) for _ in range(0, ARGS.threads)])
-    THREADS.extend([UpdateThread(q)])
+    THREADS.extend([UpdateThread(q, perms_count)])
 
-    if ARGS.source is None:
-        THREADS.extend([CertStreamThread(q)])
-    else:
-        for line in open(ARGS.source):
-            for permutation in get_permutations(line.strip()):
-                q.put(BUCKET_HOST % permutation)
+    THREADS.extend([CertStreamThread(q)])
 
     for t in THREADS:
         t.daemon = True
@@ -323,6 +339,7 @@ def main():
                 time.sleep(1)
 
         stop()
+
 
 if __name__ == "__main__":
     main()
